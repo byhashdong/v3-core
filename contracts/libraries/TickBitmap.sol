@@ -3,6 +3,9 @@ pragma solidity >=0.5.0;
 
 import './BitMath.sol';
 
+// 对于不存在的 tick，不需要初始值，因为访问 map 中不存在的 key 默认值就是 0
+// 通过对位图的每个 word(uint256) 建立索引来管理位图，即访问路径为 word index -> word -> tick bit
+
 /// @title Packed tick initialized state library
 /// @notice Stores a packed mapping of tick index to its initialized state
 /// @dev The mapping uses int16 for keys since ticks are represented as int24 and there are 256 (2^8) values per word.

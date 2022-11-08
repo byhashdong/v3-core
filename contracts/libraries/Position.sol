@@ -12,6 +12,7 @@ library Position {
     // info stored for each user's position
     struct Info {
         // the amount of liquidity owned by this position
+        // 此 position 中包含的流动性大小，即 L 值
         uint128 liquidity;
         // fee growth per unit of liquidity as of the last update to liquidity or fees owed
         uint256 feeGrowthInside0LastX128;

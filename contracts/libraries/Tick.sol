@@ -14,10 +14,19 @@ library Tick {
     using SafeCast for int256;
 
     // info stored for each initialized individual tick
+    // tick 中记录的数据
     struct Info {
         // the total position liquidity that references this tick
+        // 记录了所有引用这个 tick 的 position 流动性的和
         uint128 liquidityGross;
         // amount of net liquidity added (subtracted) when tick is crossed from left to right (right to left),
+        // 当此 tick 被越过时（从左至右），池子中整体流动性需要变化的值
+        // liquidityNet 表示当价格从左至右经过此 tick 时整体流动性需要变化的净值。
+        // 在单个流动性中，对于 lower tick 来说，它的值为正，对于 upper tick 来说它的值为 负。
+        // 如果有两个 position 中的流动性相等，例如 L = 500，并且这两个 position 同时引用了一个 tick，
+        // 其中一个为 lower tick ，另一个为 upper tick，那么对于这个 tick，它的 liquidityNet = 0。
+        // 此时我们就需要有一种机制来判断一个 tick 是否仍然在被引用中。
+        // 这里使用 liquidityGross 记录流动性的增值（不考虑 lower/upper），我们可以就通过流动性变化前后 liquidityGross 是否等于 0 来判断这个 tick 是否仍被引用。
         int128 liquidityNet;
         // fee growth per unit of liquidity on the _other_ side of this tick (relative to the current tick)
         // only has relative meaning, not absolute — the value depends on when the tick is initialized
@@ -127,6 +136,8 @@ library Tick {
 
         require(liquidityGrossAfter <= maxLiquidity, 'LO');
 
+        // 通过 liquidityGross 在进行 position 变化前后的值
+        // 来判断 tick 是否仍被引用， flipped表示该tick是否被任何position引用
         flipped = (liquidityGrossAfter == 0) != (liquidityGrossBefore == 0);
 
         if (liquidityGrossBefore == 0) {
@@ -144,6 +155,7 @@ library Tick {
         info.liquidityGross = liquidityGrossAfter;
 
         // when the lower (upper) tick is crossed left to right (right to left), liquidity must be added (removed)
+        // 更新 liquidityNet 的值，对于 upper tick，
         info.liquidityNet = upper
             ? int256(info.liquidityNet).sub(liquidityDelta).toInt128()
             : int256(info.liquidityNet).add(liquidityDelta).toInt128();

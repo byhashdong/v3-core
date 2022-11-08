@@ -32,7 +32,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     using LowGasSafeMath for int256;
     using SafeCast for uint256;
     using SafeCast for int256;
+    // tick 元数据管理的库
     using Tick for mapping(int24 => Tick.Info);
+    // tick 位图槽位的库
     using TickBitmap for mapping(int16 => uint256);
     using Position for mapping(bytes32 => Position.Info);
     using Position for Position.Info;
@@ -90,8 +92,14 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     uint128 public override liquidity;
 
     /// @inheritdoc IUniswapV3PoolState
+    // 记录了一个 tick 包含的元数据，这里只会包含所有 Position 的 lower/upper ticks
     mapping(int24 => Tick.Info) public override ticks;
     /// @inheritdoc IUniswapV3PoolState
+    // tick 位图，因为这个位图比较长（一共有 887272x2 个位），大部分的位不需要初始化
+    // 因此分成两级来管理，每 256 位为一个单位，一个单位称为一个 word
+    // map 中的键是 word 的索引
+    // tick 位图用于记录所有被引用的 lower/upper tick index，
+    // 我们可以通过 tick 位图，从当前价格找到下一个（从左至右或者从右至左）被引用的 tick index
     mapping(int16 => uint256) public override tickBitmap;
     /// @inheritdoc IUniswapV3PoolState
     mapping(bytes32 => Position.Info) public override positions;
@@ -317,6 +325,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     {
         checkTicks(params.tickLower, params.tickUpper);
 
+        // 因为后续需要多次访问 slot0，这里将其读入内存中，后续的访问就可以使用 MLOAD 而不用使用 SLOAD，
+        // 可以节省 gas（SLOAD 的成本比 MLOAD 高很多）。Uniswap v2 和 v3 大量使用了这个技巧。
         Slot0 memory _slot0 = slot0; // SLOAD for gas optimization
 
         position = _updatePosition(
@@ -328,7 +338,10 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         );
 
         if (params.liquidityDelta != 0) {
+            // 计算三种情况下 amount0 和 amount1 的值，即 x token 和 y token 的数量
+            // 代码将计算的过程封装在了 SqrtPriceMath 库中，
             if (_slot0.tick < params.tickLower) {
+                // 计算 lower/upper tick 对应的价格
                 // current tick is below the passed range; liquidity can only become in range by crossing from left to
                 // right, when we'll need _more_ token0 (it's becoming more valuable) so user must provide it
                 amount0 = SqrtPriceMath.getAmount0Delta(
@@ -379,6 +392,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @param tickLower the lower tick of the position's tick range
     /// @param tickUpper the upper tick of the position's tick range
     /// @param tick the current tick, passed to avoid sloads
+    // 添加/移除流动性时，先更新这个 Positon 对应的 lower/upper tick 中记录的元数据
+    // 更新 position
+    // 根据需要更新 tick 位图
     function _updatePosition(
         address owner,
         int24 tickLower,
@@ -386,12 +402,15 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int128 liquidityDelta,
         int24 tick
     ) private returns (Position.Info storage position) {
+        // 获取用户的 Postion
         position = positions.get(owner, tickLower, tickUpper);
 
         uint256 _feeGrowthGlobal0X128 = feeGrowthGlobal0X128; // SLOAD for gas optimization
         uint256 _feeGrowthGlobal1X128 = feeGrowthGlobal1X128; // SLOAD for gas optimization
 
         // if we need to update the ticks, do it
+        // 根据传入的参数修改 Position 对应的 lower/upper tick 中
+        // 的数据，这里可以是增加流动性，也可以是移出流动性
         bool flippedLower;
         bool flippedUpper;
         if (liquidityDelta != 0) {
@@ -405,6 +424,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 slot0.observationCardinality
             );
 
+            // 更新 lower tick 和 upper tick  fippedX 变量
+            // 表示是此 tick 的引用状态是否发生变化，即
+            // 被引用 -> 未被引用 或
+            // 未被引用 -> 被引用
+            // 后续需要根据这个变量的值来更新 tick 位图
             flippedLower = ticks.update(
                 tickLower,
                 tick,
@@ -430,6 +454,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 maxLiquidityPerTick
             );
 
+            // 如果一个 tick 第一次被引用，或者移除了所有引用
+            // 那么更新 tick 位图
             if (flippedLower) {
                 tickBitmap.flipTick(tickLower, tickSpacing);
             }
@@ -446,9 +472,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             _feeGrowthGlobal1X128
         );
 
+        // 更新 position 中的数据
+        // Postion 是以 owner, lower tick, uppper tick 作为键来存储的，
+        // 注意这里的 owner 实际上是 NonfungiblePositionManager 合约的地址。
+        // 这样当多个用户在同一个价格区间提供流动性时，在底层的 UniswapV3Pool 合约中会将他们合并存储。
+        // 而在 NonfungiblePositionManager 合约中会按用户来区别每个用户拥有的 Position.
         position.update(liquidityDelta, feeGrowthInside0X128, feeGrowthInside1X128);
 
         // clear any tick data that is no longer needed
+        // 如果移除了对 tick 的引用，那么清除之前记录的元数据
+        // 这只会发生在移除流动性的操作中
         if (liquidityDelta < 0) {
             if (flippedLower) {
                 ticks.clear(tickLower);
@@ -483,9 +516,12 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
         uint256 balance0Before;
         uint256 balance1Before;
+        // 获取当前池中的 x token, y token 余额
         if (amount0 > 0) balance0Before = balance0();
         if (amount1 > 0) balance1Before = balance1();
+        // 将需要的 x token 和 y token 数量传给回调函数，这里预期回调函数会将指定数量的 token 发送到合约中
         IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount0, amount1, data);
+        // 回调完成后，检查发送至合约的 token 是否复合预期，如果不满足检查则回滚交易
         if (amount0 > 0) require(balance0Before.add(amount0) <= balance0(), 'M0');
         if (amount1 > 0) require(balance1Before.add(amount1) <= balance1(), 'M1');
 
@@ -525,6 +561,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int24 tickUpper,
         uint128 amount
     ) external override lock returns (uint256 amount0, uint256 amount1) {
+        // 先计算出需要移除的 token 数
         (Position.Info storage position, int256 amount0Int, int256 amount1Int) = _modifyPosition(
             ModifyPositionParams({
                 owner: msg.sender,
@@ -537,6 +574,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         amount0 = uint256(-amount0Int);
         amount1 = uint256(-amount1Int);
 
+        // 注意这里，移除流动性后，将移出的 token 数记录到了 position.tokensOwed 上
         if (amount0 > 0 || amount1 > 0) {
             (position.tokensOwed0, position.tokensOwed1) = (
                 position.tokensOwed0 + uint128(amount0),
