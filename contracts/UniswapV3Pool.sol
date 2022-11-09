@@ -635,6 +635,16 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         uint256 feeAmount;
     }
 
+    // 交易步骤:
+    // 假设支付的 token 为 x
+    // 根据买入/卖出行为，P−−√ 会随着交易下降或上升，即 tick 减小或增大
+    // 在 tickBitmap 中找到和当前 tick 对应的 ic 在一个 word 中的下一个 tick 对应的 in，根据买入/卖出行为，这里分成向下查找和向上查找两种情况
+    // 如果当前 word 中没有记录其他 tick index ，那么取这个 word 的最小/最大 tick index，这么做的目的是，让单步交易中 tick 的跨度不至于太大，以减少计算中溢出的可能性（计算中会需要使用 ΔP−−√）。
+    // 在 [ic,in] 价格区间内，流动性 L 的值是不变的，我们可以根据 L 的值计算出交易运行到 in 时，所需要最多的 Δx 数量
+    // 根据上一步计算的 Δx 数量，如果满足 Δx<xremaining，那么将 i 设置为 in，并将 xremaining 减去需要支付的 Δx，随后跳至第 2 步继续计算（这里需要将 i±tickSpace 使其进入位图中的下一个 word），计算之前还需要根据元数据修改当前的流动性 L=L±ΔL
+    // 如果上一步计算 Δx，满足 Δx≥xremaining，则表示 x token 将被耗尽，则交易在此结束。
+    // 记录下结束时的价格 P−−√，将所有交易阶段的 tokenOut 数量总和返回，即为用户得到的 token 数量
+    // 上一步的计算过程还需要考虑费率的因素，为了让计算简单化，可能会多收费
     /// @inheritdoc IUniswapV3PoolActions
     function swap(
         address recipient,
@@ -645,6 +655,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     ) external override noDelegateCall returns (int256 amount0, int256 amount1) {
         require(amountSpecified != 0, 'AS');
 
+        // 将交易前的元数据保存在内存中，后续的访问通过 `MLOAD` 完成，节省 gas
         Slot0 memory slot0Start = slot0;
 
         require(slot0Start.unlocked, 'LOK');
@@ -655,8 +666,10 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             'SPL'
         );
 
+        // 防止交易过程中回调到合约中其他的函数中修改状态变量
         slot0.unlocked = false;
 
+        // 这里也是缓存交易钱的数据，节省 gas
         SwapCache memory cache = SwapCache({
             liquidityStart: liquidity,
             blockTimestamp: _blockTimestamp(),
@@ -666,8 +679,10 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             computedLatestObservation: false
         });
 
+        // 判断是否指定了 tokenIn 的数量
         bool exactInput = amountSpecified > 0;
 
+        // 保存交易过程中计算所需的中间变量，这些值在交易的步骤中可能会发生变化
         SwapState memory state = SwapState({
             amountSpecifiedRemaining: amountSpecified,
             amountCalculated: 0,
@@ -680,10 +695,13 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
         // continue swapping as long as we haven't used the entire input/output and haven't reached the price limit
         while (state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
+            // 交易过程每一次循环的状态变量
             StepComputations memory step;
 
+            // 交易的起始价格
             step.sqrtPriceStartX96 = state.sqrtPriceX96;
 
+            // 通过位图找到下一个可以选的交易价格，这里可能是下一个流动性的边界，也可能还是在本流动性中
             (step.tickNext, step.initialized) = tickBitmap.nextInitializedTickWithinOneWord(
                 state.tick,
                 tickSpacing,
@@ -698,9 +716,12 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             }
 
             // get the price for the next tick
+            // 从 tick index 计算 sqrt(price)
             step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.tickNext);
 
             // compute values to swap to the target tick, price limit, or point where input/output amount is exhausted
+            // 计算当价格到达下一个交易价格时，tokenIn 是否被耗尽，如果被耗尽，则交易结束，还需要重新计算出 tokenIn 耗尽时的价格
+            // 如果没被耗尽，那么还需要继续进入下一个循环
             (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount) = SwapMath.computeSwapStep(
                 state.sqrtPriceX96,
                 (zeroForOne ? step.sqrtPriceNextX96 < sqrtPriceLimitX96 : step.sqrtPriceNextX96 > sqrtPriceLimitX96)
@@ -711,6 +732,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 fee
             );
 
+            // 更新 tokenIn 的余额，以及 tokenOut 数量，注意当指定 tokenIn 的数量进行交易时，这里的 tokenOut 是负数
             if (exactInput) {
                 state.amountSpecifiedRemaining -= (step.amountIn + step.feeAmount).toInt256();
                 state.amountCalculated = state.amountCalculated.sub(step.amountOut.toInt256());
@@ -731,8 +753,10 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 state.feeGrowthGlobalX128 += FullMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
 
             // shift tick if we reached the next price
+            // 按需决定是否需要更新流动性 L 的值
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
                 // if the tick is initialized, run the tick transition
+                // 检查 tick index 是否为另一个流动性的边界
                 if (step.initialized) {
                     // check for the placeholder value, which we replace with the actual value the first time the swap
                     // crosses an initialized tick
@@ -757,14 +781,18 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                     );
                     // if we're moving leftward, we interpret liquidityNet as the opposite sign
                     // safe because liquidityNet cannot be type(int128).min
+                    // 根据价格增加/减少，即向左或向右移动，增加/减少相应的流动性
                     if (zeroForOne) liquidityNet = -liquidityNet;
 
+                    // 更新流动性
                     state.liquidity = LiquidityMath.addDelta(state.liquidity, liquidityNet);
                 }
 
+                // 在这里更 tick 的值，使得下一次循环时让 tickBitmap 进入下一个 word 中查询
                 state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
             } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
                 // recompute unless we're on a lower tick boundary (i.e. already transitioned ticks), and haven't moved
+                // 如果 tokenIn 被耗尽，那么计算当前价格对应的 tick
                 state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
             }
         }
@@ -803,16 +831,21 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             if (state.protocolFee > 0) protocolFees.token1 += state.protocolFee;
         }
 
+        // 确定最终用户支付的 token 数和得到的 token 数
         (amount0, amount1) = zeroForOne == exactInput
             ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
             : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
 
         // do the transfers and collect payment
+        // 扣除用户需要支付的 token
         if (zeroForOne) {
+            // 将 tokenOut 支付给用户，前面说过 tokenOut 记录的是负数
             if (amount1 < 0) TransferHelper.safeTransfer(token1, recipient, uint256(-amount1));
 
             uint256 balance0Before = balance0();
+            // 还是通过回调的方式，扣除用户需要支持的 token
             IUniswapV3SwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+            // 校验扣除是否成功
             require(balance0Before.add(uint256(amount0)) <= balance0(), 'IIA');
         } else {
             if (amount0 < 0) TransferHelper.safeTransfer(token0, recipient, uint256(-amount0));
@@ -822,7 +855,9 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             require(balance1Before.add(uint256(amount1)) <= balance1(), 'IIA');
         }
 
+        // 记录日志
         emit Swap(msg.sender, recipient, amount0, amount1, state.sqrtPriceX96, state.liquidity, state.tick);
+        // 解除防止重入的锁
         slot0.unlocked = true;
     }
 
